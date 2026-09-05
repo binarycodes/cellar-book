@@ -141,6 +141,18 @@ jobs:
             -derivedDataPath build/dd \
             test 2>&1 | tee test.log
 
+      # The build job's gate only compiles the app target, so warnings in the
+      # test target were invisible to CI until a clean build surfaced them.
+      - name: Fail on Swift warnings in the test target
+        if: steps.probe.outputs.found == 'true'
+        run: |
+          count=$(grep -cE "\.swift.*warning:" test.log || true)
+          echo "Swift warnings: $count"
+          if [ "$count" -ne 0 ]; then
+            grep -E "\.swift.*warning:" test.log | sort -u
+            exit 1
+          fi
+
       # A suite that skips its security tests must not read as a pass.
       - name: Fail if security tests were skipped
         if: steps.probe.outputs.found == 'true'
