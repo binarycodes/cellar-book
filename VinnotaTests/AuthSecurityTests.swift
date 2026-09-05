@@ -2,6 +2,7 @@ import AuthenticationServices
 import Foundation
 import ObjectiveC
 import Security
+import SwiftData
 import Testing
 import UIKit
 
@@ -12,24 +13,60 @@ import UIKit
 /// `AuthController` keeps every one of these private, which is right for the
 /// app and useless for a test: an assertion against `auth.displayName` proves
 /// only that a getter agrees with its own setter. These literals are the real
-/// on-disk contract — the keychain account, the two `UserDefaults` keys, the
-/// avatar's filename, and the user ID that marks a session as stubbed — so the
-/// tests below read and write *storage* and let the controller observe it.
+/// on-disk contract — the keychain account, the two `UserDefaults` key *shapes*,
+/// the avatar's filename *shape*, and the user ID that marks a session as
+/// stubbed — so the tests below read and write *storage* and let the controller
+/// observe it.
+///
+/// The identity keys and the avatar filename are no longer global: each carries
+/// the account's token, so a second Apple ID on this device reads a different
+/// set. The store file is scoped the same way — see `CellarStore`.
 ///
 /// A change to any of them is a migration: the old values keep living on the
 /// device, and these tests are meant to fail when that happens.
 private enum Storage {
     static let keychainAccount = "com.vinnota.appleUserID"
     static let stubUserID = "stub.local.account"
-    static let nameKey = "com.vinnota.displayName"
-    static let emailKey = "com.vinnota.email"
-    static let avatarFilename = "avatar.jpg"
 
-    static var avatarURL: URL? {
+    static let nameKeyPrefix = "com.vinnota.displayName."
+    static let emailKeyPrefix = "com.vinnota.email."
+    static let avatarPrefix = "avatar-"
+    static let avatarSuffix = ".jpg"
+    static let storePrefix = "cellar-"
+
+    /// The bucket a signed-out app resolves to. Nothing is ever written here —
+    /// which is exactly why a signed-out controller reads no identity at all.
+    static let signedOutToken = "signed-out"
+
+    static func nameKey(_ token: String) -> String { nameKeyPrefix + token }
+    static func emailKey(_ token: String) -> String { emailKeyPrefix + token }
+    static func avatarFilename(_ token: String) -> String { avatarPrefix + token + avatarSuffix }
+
+    static var supportDirectory: URL? {
         try? FileManager.default.url(for: .applicationSupportDirectory,
                                      in: .userDomainMask,
                                      appropriateFor: nil, create: true)
-            .appendingPathComponent(avatarFilename)
+    }
+
+    static func avatarURL(_ token: String) -> URL? {
+        supportDirectory?.appendingPathComponent(avatarFilename(token))
+    }
+
+    /// Every avatar file belonging to any account, however many there are.
+    static func avatarFiles() -> [URL] {
+        guard let dir = supportDirectory,
+              let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path)
+        else { return [] }
+        return names
+            .filter { $0.hasPrefix(avatarPrefix) && $0.hasSuffix(avatarSuffix) }
+            .map { dir.appendingPathComponent($0) }
+    }
+
+    /// The identity keys currently present for any account.
+    static func identityKeys() -> [String] {
+        UserDefaults.standard.dictionaryRepresentation().keys.filter {
+            $0.hasPrefix(nameKeyPrefix) || $0.hasPrefix(emailKeyPrefix)
+        }
     }
 }
 
@@ -72,13 +109,12 @@ private func keychainDelete() {
 
 /// Whether this build can use the keychain at all.
 ///
-/// `xcodebuild … CODE_SIGNING_ALLOWED=NO` — what CI runs, and what the command
-/// in TESTING.md runs — produces an unsigned application. An unsigned process
-/// has no `application-identifier` entitlement, and the simulator keychain
-/// answers every request from one with `errSecMissingEntitlement` (-34018).
-/// `AuthController`'s own `SecItemAdd` fails there too, silently: it ignores
-/// the status, so in this configuration the app signs in and then forgets the
-/// session at the next launch.
+/// `xcodebuild … CODE_SIGNING_ALLOWED=NO` produces an unsigned application. An
+/// unsigned process has no `application-identifier` entitlement, and the
+/// simulator keychain answers every request from one with
+/// `errSecMissingEntitlement` (-34018). `AuthController`'s own `SecItemAdd`
+/// fails there too, silently: it ignores the status, so in this configuration
+/// the app signs in and then forgets the session at the next launch.
 ///
 /// The tests that need a working keychain therefore say so and are skipped
 /// rather than passing vacuously against a store that swallows everything.
@@ -103,49 +139,97 @@ private let keychainSkipReason = Comment(
     rawValue: "the keychain refuses unsigned builds with errSecMissingEntitlement; "
         + "build with code signing enabled to exercise session persistence")
 
-/// Establishes a local session the way the app does.
+/// Whether a session can be established without Apple's UI.
+///
+/// Identity and the profile picture are now resolved against the *signed-in*
+/// account, so a test that wants to read either has to be signed in as
+/// somebody. The only way to do that from a test is the debug stub, which a
+/// Release compile does not contain.
+#if DEBUG
+private let canSignInLocally = true
+#else
+private let canSignInLocally = false
+#endif
+
+/// A session that can be established *and* survives a relaunch.
+private let localSessionAvailable = keychainAvailable && canSignInLocally
+
+private let localSessionSkipReason = Comment(
+    rawValue: "identity and the profile picture are read for the signed-in account only, "
+        + "and a Release compile has no way to establish a local session — "
+        + "the debug sign-in stub is compiled out")
+
+/// Establishes a local session the way the app does, and returns the token the
+/// identity of that session is filed under.
 ///
 /// In DEBUG that is the stub itself. The stub does not exist in a Release
-/// compile, so the credential is planted directly there — which keeps this
-/// file compiling in both configurations, as the app target does.
+/// compile, so the credential is planted directly there — which keeps this file
+/// compiling in both configurations, as the app target does. The returned token
+/// is whatever the controller actually ended up on, so seeding identity through
+/// it stays truthful in either configuration.
 @MainActor
-private func establishLocalSession(_ auth: AuthController) {
+@discardableResult
+private func establishLocalSession(_ auth: AuthController) -> String {
     #if DEBUG
     auth.signInStubbed()
     #else
     keychainWrite(Storage.stubUserID)
     #endif
+    return CellarStore.token(for: auth.state.accountID)
+}
+
+/// Writes name and/or email into one account's bucket, from outside the app.
+private func seedIdentity(token: String, name: String? = nil, email: String? = nil) {
+    if let name { UserDefaults.standard.set(name, forKey: Storage.nameKey(token)) }
+    if let email { UserDefaults.standard.set(email, forKey: Storage.emailKey(token)) }
+}
+
+/// Puts a picture in one account's avatar slot without going through the
+/// controller — the only way to give an account a photo it is not signed in as.
+private func plantAvatar(_ data: Data, token: String) -> URL? {
+    guard let url = Storage.avatarURL(token) else { return nil }
+    try? data.write(to: url, options: .atomic)
+    return url
 }
 
 // MARK: - Global state, saved and put back
 
-/// Everything below writes the real `UserDefaults`, the real keychain and a
-/// real file in Application Support — the same ones the running app uses. Each
-/// test starts from a clean slate and hands back exactly what it found.
+/// Everything below writes the real `UserDefaults`, the real keychain and real
+/// files in Application Support — the same ones the running app uses. Each test
+/// starts from a clean slate and hands back exactly what it found.
+///
+/// The sweep is by prefix rather than by a fixed pair of keys: identity is now
+/// filed per account, so how many keys and how many avatar files exist depends
+/// on how many accounts have ever used this device.
 @MainActor
 private func withCleanAuthState(_ body: () async throws -> Void) async throws {
     let defaults = UserDefaults.standard
-    let savedName = defaults.object(forKey: Storage.nameKey)
-    let savedEmail = defaults.object(forKey: Storage.emailKey)
-    let savedSession = keychainRead()
-    let savedAvatar = Storage.avatarURL.flatMap { try? Data(contentsOf: $0) }
 
-    defaults.removeObject(forKey: Storage.nameKey)
-    defaults.removeObject(forKey: Storage.emailKey)
+    var savedIdentity: [String: Any] = [:]
+    for key in Storage.identityKeys() {
+        if let value = defaults.object(forKey: key) { savedIdentity[key] = value }
+    }
+    let savedSession = keychainRead()
+    var savedAvatars: [String: Data] = [:]
+    for url in Storage.avatarFiles() {
+        if let data = try? Data(contentsOf: url) { savedAvatars[url.lastPathComponent] = data }
+    }
+
+    for key in savedIdentity.keys { defaults.removeObject(forKey: key) }
     keychainDelete()
-    if let url = Storage.avatarURL { try? FileManager.default.removeItem(at: url) }
+    for url in Storage.avatarFiles() { try? FileManager.default.removeItem(at: url) }
 
     defer {
-        if let savedName { defaults.set(savedName, forKey: Storage.nameKey) }
-        else { defaults.removeObject(forKey: Storage.nameKey) }
-        if let savedEmail { defaults.set(savedEmail, forKey: Storage.emailKey) }
-        else { defaults.removeObject(forKey: Storage.emailKey) }
+        for key in Storage.identityKeys() { defaults.removeObject(forKey: key) }
+        for (key, value) in savedIdentity { defaults.set(value, forKey: key) }
 
         if let savedSession { keychainWrite(savedSession) } else { keychainDelete() }
 
-        if let url = Storage.avatarURL {
-            if let savedAvatar { try? savedAvatar.write(to: url, options: .atomic) }
-            else { try? FileManager.default.removeItem(at: url) }
+        for url in Storage.avatarFiles() { try? FileManager.default.removeItem(at: url) }
+        if let dir = Storage.supportDirectory {
+            for (name, data) in savedAvatars {
+                try? data.write(to: dir.appendingPathComponent(name), options: .atomic)
+            }
         }
     }
 
@@ -256,7 +340,8 @@ struct DebugStubTests {
             // the one fixed local user ID, and it is flagged as not real.
             #expect(auth.state == .signedIn(userID: Storage.stubUserID, stubbed: true))
             #expect(auth.isStubbedSession)
-            // It invents no identity — a stub account is nameless.
+            // It invents no identity — a stub account is nameless, and it reads
+            // its own bucket rather than whatever the last account left behind.
             #expect(auth.displayName == nil)
             #expect(auth.email == nil)
             #expect(auth.avatar == nil)
@@ -314,14 +399,13 @@ struct DebugStubTests {
     /// **The Release rejection branch is NOT covered by this suite.**
     ///
     /// `AuthController.restore()` handles a stub credential in two arms of an
-    /// `#if DEBUG` (AuthController.swift:111-120). Test bundles compile in
-    /// DEBUG, so only the DEBUG arm is ever built here — the `#else` arm that
-    /// destroys a stale stub in a shipped build is not merely unasserted, it is
-    /// not compiled. Confirmed by mutation: replacing that arm's
-    /// `deleteKeychain(); state = .signedOut` with
-    /// `state = .signedIn(userID: stored, stubbed: true)` — a shipped build
-    /// admitting a dev build's session with no credential at all — leaves the
-    /// whole 302-test run green.
+    /// `#if DEBUG`. Test bundles compile in DEBUG, so only the DEBUG arm is
+    /// ever built here — the `#else` arm that destroys a stale stub in a
+    /// shipped build is not merely unasserted, it is not compiled. Confirmed by
+    /// mutation: replacing that arm's `deleteKeychain(); state = .signedOut`
+    /// with `state = .signedIn(userID: stored, stubbed: true)` — a shipped
+    /// build admitting a dev build's session with no credential at all — leaves
+    /// the whole run green.
     ///
     /// The `#else` block below is therefore a latent assertion, correct but
     /// unreachable under `xcodebuild test`. What actually guards the release
@@ -429,111 +513,256 @@ struct DebugStubTests {
         #endif
     }
 
-    @Test("FINDING (medium): rejecting a session at launch leaves the identity and photo on disk",
+    /// Was: `rejectedSessionLeavesResidualIdentity`, a FINDING (medium)
+    /// asserting the leak as it stood. Two things closed it: identity and the
+    /// picture are now resolved against the *signed-in* account, so a
+    /// signed-out controller has no bucket to read from; and `restore()` calls
+    /// `loadAvatar()` after the session has been settled rather than before, so
+    /// a credential that is about to be thrown out never gets its photo decoded
+    /// into memory in the first place.
+    ///
+    /// The data itself deliberately stays on disk — see `signOut()`. What is
+    /// asserted here is that none of it is *reachable* once the session is
+    /// refused.
+    @Test("A rejected session at launch leaves nothing readable — no name, no email, no photo",
           .enabled(if: keychainAvailable, keychainSkipReason))
-    func rejectedSessionLeavesResidualIdentity() async throws {
+    func rejectedSessionLeavesNoReadableIdentity() async throws {
         try await withCleanAuthState {
-            // A previous session's leavings: name, email, profile photograph.
-            UserDefaults.standard.set("Marie Kondo", forKey: Storage.nameKey)
-            UserDefaults.standard.set("marie@example.com", forKey: Storage.emailKey)
-            let seeder = AuthController()
-            seeder.setAvatar(jpegFixture(200, 200))
-            let avatarURL = try #require(Storage.avatarURL)
+            // The account whose credential is about to be refused, with a full
+            // set of leavings: name, email, profile photograph.
+            let rejectedID = "001234.9f8e7d6c5b4a39281706abcdef012345.1122"
+            let token = CellarStore.token(for: rejectedID)
+            seedIdentity(token: token, name: "Marie Kondo", email: "marie@example.com")
+            let avatarURL = try #require(plantAvatar(jpegFixture(200, 200), token: token))
             #expect(FileManager.default.fileExists(atPath: avatarURL.path))
 
             // The credential is no longer good, so launch throws the session
             // out. This is the same branch a Release build takes when it finds
             // a stub session left behind by a dev build.
-            keychainWrite("001234.9f8e7d6c5b4a39281706abcdef012345.1122")
+            keychainWrite(rejectedID)
             let auth = AuthController()
             await auth.restore()
 
             #expect(auth.state == .signedOut)
             #expect(keychainRead() == nil)
 
-            // FINDING (medium): AuthController.swift:126-129 (the `default:`
-            // branch of `restore()`) and :114-118 (the Release stub branch)
-            // both delete the keychain item and return; neither calls
-            // `signOut()`. So the display name, the email address and the
-            // profile photograph outlive the session that produced them.
-            // In the shipped app: a device that ran a dev build and is then
-            // given a Release build shows the login screen while the dev
-            // account's email and photo are still on disk — and `restore()`
-            // has already loaded that photo into memory, because
-            // `loadAvatar()` runs at :108 before the session is checked at
-            // all. Asserted here as it is, not as it should be.
-            #expect(UserDefaults.standard.string(forKey: Storage.nameKey) == "Marie Kondo")
-            #expect(UserDefaults.standard.string(forKey: Storage.emailKey) == "marie@example.com")
+            // The leak, closed. Nothing of the refused account is readable:
+            // not through the controller's accessors, and not in memory.
+            #expect(auth.avatar == nil, "restore() must settle the session before loading a photo")
+            #expect(auth.displayName == nil)
+            #expect(auth.email == nil)
+            #expect(auth.initials == nil)
+
+            // The bytes are still on disk, and that is deliberate: Apple hands
+            // over a name and an email exactly once, so throwing them away on a
+            // refused launch would make the account permanently nameless if the
+            // refusal was a transient daemon failure. `forgetThisAccount()` is
+            // the erase, and it is a separate intention.
+            #expect(UserDefaults.standard.string(forKey: Storage.nameKey(token)) == "Marie Kondo")
             #expect(FileManager.default.fileExists(atPath: avatarURL.path))
-            #expect(auth.displayName == "Marie Kondo")
-            #expect(auth.email == "marie@example.com")
-            #expect(auth.avatar != nil, "restore() loads the avatar before it checks the session")
+            // But they are filed under that account's token, not somewhere a
+            // different account would find them.
+            #expect(Storage.nameKey(token) != Storage.nameKey(Storage.signedOutToken))
         }
     }
 }
 
 // MARK: - Session persistence
 
-@Suite("Session persistence · what is stored and what sign-out clears", .serialized)
+@Suite("Session persistence · what is stored, what sign-out ends, what it keeps", .serialized)
 @MainActor
 struct SessionPersistenceTests {
 
-    @Test("displayName and email read the documented UserDefaults keys, not some other pair")
-    func identityIsReadFromTheDocumentedKeys() async throws {
+    @Test("displayName and email read the signed-in account's keys, not some other pair",
+          .enabled(if: canSignInLocally, localSessionSkipReason))
+    func identityIsReadFromTheAccountScopedKeys() async throws {
         try await withCleanAuthState {
             let auth = AuthController()
+            let token = establishLocalSession(auth)
             #expect(auth.displayName == nil)
             #expect(auth.email == nil)
 
-            UserDefaults.standard.set("Marie Kondo", forKey: Storage.nameKey)
-            UserDefaults.standard.set("marie@example.com", forKey: Storage.emailKey)
+            UserDefaults.standard.set("Marie Kondo", forKey: Storage.nameKey(token))
+            UserDefaults.standard.set("marie@example.com", forKey: Storage.emailKey(token))
 
             // Written to storage from outside, read back through the app.
+            #expect(auth.displayName == "Marie Kondo")
+            #expect(auth.email == "marie@example.com")
+
+            // The keys really are the account-scoped ones: the old global pair
+            // is not consulted, so a device upgraded from that layout does not
+            // hand one account the previous global identity.
+            UserDefaults.standard.set("Someone Else", forKey: "com.vinnota.displayName")
+            UserDefaults.standard.set("someone@example.com", forKey: "com.vinnota.email")
+            defer {
+                UserDefaults.standard.removeObject(forKey: "com.vinnota.displayName")
+                UserDefaults.standard.removeObject(forKey: "com.vinnota.email")
+            }
             #expect(auth.displayName == "Marie Kondo")
             #expect(auth.email == "marie@example.com")
         }
     }
 
-    @Test("The identity is not held in memory — a second controller sees the same values")
+    @Test("Signed out, there is no identity to read at all")
+    func signedOutReadsNoIdentity() async throws {
+        try await withCleanAuthState {
+            // Seed every bucket a device could plausibly hold: two real
+            // accounts and the signed-out one nothing ever writes to.
+            seedIdentity(token: CellarStore.token(for: "account.one"),
+                         name: "Marie Kondo", email: "marie@example.com")
+            seedIdentity(token: CellarStore.token(for: "account.two"),
+                         name: "Jean Peridot", email: "jean@example.com")
+
+            let auth = AuthController()
+            #expect(auth.state == .signedOut)
+            #expect(auth.displayName == nil)
+            #expect(auth.email == nil)
+            #expect(auth.initials == nil)
+            auth.loadAvatar()
+            #expect(auth.avatar == nil)
+        }
+    }
+
+    @Test("The identity is not held in memory — a second controller on the same account agrees",
+          .enabled(if: canSignInLocally, localSessionSkipReason))
     func identityIsSharedThroughStorage() async throws {
         try await withCleanAuthState {
-            UserDefaults.standard.set("Jean Peridot", forKey: Storage.nameKey)
-            UserDefaults.standard.set("jean@example.com", forKey: Storage.emailKey)
-
             let first = AuthController()
+            let token = establishLocalSession(first)
+            seedIdentity(token: token, name: "Jean Peridot", email: "jean@example.com")
+
             let second = AuthController()
+            establishLocalSession(second)
+
             #expect(first.displayName == second.displayName)
             #expect(first.email == second.email)
             #expect(second.email == "jean@example.com")
         }
     }
 
-    @Test("Sign-out clears the name, the email and the avatar from storage")
-    func signOutClearsTheIdentityAndThePicture() async throws {
+    /// Was: `signOutClearsTheIdentityAndThePicture`. Sign-out deliberately no
+    /// longer destroys anything — Apple supplies `fullName` and `email` on the
+    /// first authorization only, so erasing them at sign-out made a returning
+    /// user permanently nameless. What sign-out ends is the *session*.
+    @Test("Sign-out ends the session and keeps the account's name, email and picture",
+          .enabled(if: canSignInLocally, localSessionSkipReason))
+    func signOutKeepsTheAccountsIdentityAndPicture() async throws {
         try await withCleanAuthState {
             let auth = AuthController()
-            establishLocalSession(auth)
-            UserDefaults.standard.set("Marie Kondo", forKey: Storage.nameKey)
-            UserDefaults.standard.set("marie@example.com", forKey: Storage.emailKey)
+            let token = establishLocalSession(auth)
+            seedIdentity(token: token, name: "Marie Kondo", email: "marie@example.com")
             auth.setAvatar(jpegFixture(300, 300))
 
-            let avatarURL = try #require(Storage.avatarURL)
+            let avatarURL = try #require(Storage.avatarURL(token))
             #expect(FileManager.default.fileExists(atPath: avatarURL.path))
+            #expect(auth.displayName == "Marie Kondo")
 
             auth.signOut()
 
-            // In memory.
+            // In memory: the session is over and nothing of it is reachable.
             #expect(auth.state == .signedOut)
             #expect(auth.isStubbedSession == false)
             #expect(auth.displayName == nil)
             #expect(auth.email == nil)
             #expect(auth.avatar == nil)
 
-            // And — the part that actually matters — in storage. A residual
-            // credential after sign-out is the defect being looked for here.
-            #expect(UserDefaults.standard.object(forKey: Storage.nameKey) == nil)
-            #expect(UserDefaults.standard.object(forKey: Storage.emailKey) == nil)
+            // On disk: the account's own data is untouched, under its own keys.
+            #expect(UserDefaults.standard.string(forKey: Storage.nameKey(token)) == "Marie Kondo")
+            #expect(UserDefaults.standard.string(forKey: Storage.emailKey(token)) == "marie@example.com")
+            #expect(FileManager.default.fileExists(atPath: avatarURL.path))
+        }
+    }
+
+    @Test("Signing back in as the same account finds its name, email and picture again",
+          .enabled(if: canSignInLocally, localSessionSkipReason))
+    func signingBackInRestoresTheIdentity() async throws {
+        try await withCleanAuthState {
+            let auth = AuthController()
+            let token = establishLocalSession(auth)
+            seedIdentity(token: token, name: "Marie Kondo", email: "marie@example.com")
+            auth.setAvatar(jpegFixture(300, 300))
+            auth.signOut()
+
+            // A whole new launch, signing in as the same account.
+            let returning = AuthController()
+            let sameToken = establishLocalSession(returning)
+            #expect(sameToken == token, "the same account resolves to the same bucket")
+            returning.loadAvatar()
+
+            #expect(returning.displayName == "Marie Kondo")
+            #expect(returning.email == "marie@example.com")
+            #expect(returning.initials == "MK")
+            #expect(returning.avatar != nil)
+        }
+    }
+
+    /// Was part of `signOutClearsTheIdentityAndThePicture`. The destructive
+    /// erase now lives in its own method, because signing out and deleting your
+    /// data are different intentions.
+    @Test("forgetThisAccount erases the name, the email and the picture",
+          .enabled(if: canSignInLocally, localSessionSkipReason))
+    func forgetThisAccountErasesEverythingItOwns() async throws {
+        try await withCleanAuthState {
+            let auth = AuthController()
+            let token = establishLocalSession(auth)
+            seedIdentity(token: token, name: "Marie Kondo", email: "marie@example.com")
+            auth.setAvatar(jpegFixture(300, 300))
+
+            let avatarURL = try #require(Storage.avatarURL(token))
+            #expect(FileManager.default.fileExists(atPath: avatarURL.path))
+
+            auth.forgetThisAccount()
+
+            #expect(auth.state == .signedOut)
+            #expect(auth.avatar == nil)
+            #expect(auth.displayName == nil)
+            #expect(auth.email == nil)
+            #expect(UserDefaults.standard.object(forKey: Storage.nameKey(token)) == nil)
+            #expect(UserDefaults.standard.object(forKey: Storage.emailKey(token)) == nil)
             #expect(FileManager.default.fileExists(atPath: avatarURL.path) == false)
+
+            // And it ends the session too, so nothing is left signed in to a
+            // account that no longer has any data.
+            #expect(keychainRead() == nil)
+        }
+    }
+
+    @Test("forgetThisAccount touches only the signed-in account",
+          .enabled(if: canSignInLocally, localSessionSkipReason))
+    func forgetThisAccountLeavesOtherAccountsAlone() async throws {
+        try await withCleanAuthState {
+            let otherToken = CellarStore.token(for: "some.other.apple.id")
+            seedIdentity(token: otherToken, name: "Jean Peridot", email: "jean@example.com")
+            let otherAvatar = try #require(plantAvatar(jpegFixture(120, 120), token: otherToken))
+
+            let auth = AuthController()
+            let token = establishLocalSession(auth)
+            #expect(token != otherToken)
+            seedIdentity(token: token, name: "Marie Kondo", email: "marie@example.com")
+            auth.setAvatar(jpegFixture(120, 120))
+
+            auth.forgetThisAccount()
+
+            #expect(UserDefaults.standard.string(forKey: Storage.nameKey(otherToken)) == "Jean Peridot")
+            #expect(UserDefaults.standard.string(forKey: Storage.emailKey(otherToken)) == "jean@example.com")
+            #expect(FileManager.default.fileExists(atPath: otherAvatar.path))
+        }
+    }
+
+    @Test("forgetThisAccount while signed out does nothing and does not crash")
+    func forgetThisAccountFromASignedOutStateIsSafe() async throws {
+        try await withCleanAuthState {
+            let strangerToken = CellarStore.token(for: "someone.else")
+            seedIdentity(token: strangerToken, name: "Jean Peridot")
+
+            let auth = AuthController()
+            auth.forgetThisAccount()
+
+            #expect(auth.state == .signedOut)
+            // There is no signed-in account to erase, so nothing is erased —
+            // in particular it does not fall through to the signed-out bucket
+            // and start deleting whatever it finds.
+            #expect(UserDefaults.standard.string(forKey: Storage.nameKey(strangerToken)) == "Jean Peridot")
         }
     }
 
@@ -550,15 +779,20 @@ struct SessionPersistenceTests {
         }
     }
 
-    @Test("Sign-out reaches the preferences store, not only the in-process cache")
-    func signOutReachesThePreferencesStore() async throws {
+    /// Was: `signOutReachesThePreferencesStore`, which asserted that sign-out
+    /// removed the email from the preferences daemon. Sign-out no longer
+    /// deletes anything, so the same technique is pointed at the method that
+    /// does — and at proving the address really is persisted in the clear.
+    @Test("forgetThisAccount reaches the preferences store, not only the in-process cache",
+          .enabled(if: canSignInLocally, localSessionSkipReason))
+    func forgetThisAccountReachesThePreferencesStore() async throws {
         try await withCleanAuthState {
-            let key = Storage.emailKey as CFString
             let address = "marie.kondo.private@example.com"
 
             let auth = AuthController()
-            establishLocalSession(auth)
-            UserDefaults.standard.set(address, forKey: Storage.emailKey)
+            let token = establishLocalSession(auth)
+            let key = Storage.emailKey(token) as CFString
+            UserDefaults.standard.set(address, forKey: Storage.emailKey(token))
             CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication)
 
             // `CFPreferencesCopyAppValue` goes to the preferences daemon, so
@@ -567,15 +801,23 @@ struct SessionPersistenceTests {
             // is not usable for this: cfprefsd writes it back on its own
             // schedule, and it is still 42 bytes long moments after a write.)
             // The precondition is an assertion too — if the address never
-            // reached the store, the check after sign-out would prove nothing.
+            // reached the store, the check afterwards would prove nothing.
             let before = CFPreferencesCopyAppValue(key, kCFPreferencesCurrentApplication) as? String
             #expect(before == address, "the email is persisted in the clear, unencrypted")
 
+            // Sign-out is not what removes it, deliberately.
             auth.signOut()
+            CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication)
+            #expect(CFPreferencesCopyAppValue(key, kCFPreferencesCurrentApplication) as? String == address,
+                    "sign-out keeps the account's data on purpose")
+
+            // Erasing the account is.
+            establishLocalSession(auth)
+            auth.forgetThisAccount()
             CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication)
 
             let after = CFPreferencesCopyAppValue(key, kCFPreferencesCurrentApplication) as? String
-            #expect(after == nil, "the address outlives sign-out in the preferences store")
+            #expect(after == nil, "the address outlives account erasure in the preferences store")
         }
     }
 
@@ -603,11 +845,13 @@ struct SessionPersistenceTests {
         }
     }
 
-    @Test("After sign-out a fresh launch finds no session")
+    @Test("After sign-out a fresh launch finds no session and reads no identity",
+          .enabled(if: localSessionAvailable, localSessionSkipReason))
     func noResidualSessionAfterSignOut() async throws {
         try await withCleanAuthState {
             let auth = AuthController()
-            establishLocalSession(auth)
+            let token = establishLocalSession(auth)
+            seedIdentity(token: token, name: "Marie Kondo", email: "marie@example.com")
             auth.setAvatar(jpegFixture(150, 150))
             auth.signOut()
 
@@ -615,9 +859,12 @@ struct SessionPersistenceTests {
             await relaunched.restore()
             #expect(relaunched.state == .signedOut)
             #expect(relaunched.isStubbedSession == false)
+            // The account's data is still on disk — it is simply nobody's to
+            // read until that account signs in again.
             #expect(relaunched.avatar == nil)
             #expect(relaunched.displayName == nil)
             #expect(relaunched.email == nil)
+            #expect(UserDefaults.standard.string(forKey: Storage.nameKey(token)) == "Marie Kondo")
         }
     }
 
@@ -661,32 +908,36 @@ struct SessionPersistenceTests {
 @MainActor
 struct CredentialHandlingTests {
 
-    @Test("A stored identity survives a later sign-in that carries no name or email")
+    @Test("A stored identity survives a later sign-in that carries no name or email",
+          .enabled(if: canSignInLocally, localSessionSkipReason))
     func aLaterSignInDoesNotWipeTheStoredIdentity() async throws {
         try await withCleanAuthState {
             // The first authorization: Apple hands the name and email over
-            // once, and they are written to storage at that one opportunity.
-            UserDefaults.standard.set("Marie Kondo", forKey: Storage.nameKey)
-            UserDefaults.standard.set("marie@example.com", forKey: Storage.emailKey)
+            // once, and they are written to that account's bucket at that one
+            // opportunity.
+            let token = CellarStore.token(for: Storage.stubUserID)
+            seedIdentity(token: token, name: "Marie Kondo", email: "marie@example.com")
 
             // Every later sign-in arrives with both fields nil. The identity
             // must not be cleared to match, or a returning user is nameless
             // forever — Apple never offers those fields again.
             let auth = AuthController()
-            establishLocalSession(auth)
+            let signedInToken = establishLocalSession(auth)
+            #expect(signedInToken == token)
 
             #expect(auth.displayName == "Marie Kondo")
             #expect(auth.email == "marie@example.com")
-            #expect(UserDefaults.standard.string(forKey: Storage.nameKey) == "Marie Kondo")
-            #expect(UserDefaults.standard.string(forKey: Storage.emailKey) == "marie@example.com")
+            #expect(UserDefaults.standard.string(forKey: Storage.nameKey(token)) == "Marie Kondo")
+            #expect(UserDefaults.standard.string(forKey: Storage.emailKey(token)) == "marie@example.com")
         }
     }
 
-    @Test("A relaunch does not disturb the stored identity either")
+    @Test("A relaunch does not disturb the stored identity either",
+          .enabled(if: localSessionAvailable, localSessionSkipReason))
     func restoreDoesNotWipeTheStoredIdentity() async throws {
         try await withCleanAuthState {
-            UserDefaults.standard.set("Marie Kondo", forKey: Storage.nameKey)
-            UserDefaults.standard.set("marie@example.com", forKey: Storage.emailKey)
+            let token = CellarStore.token(for: Storage.stubUserID)
+            seedIdentity(token: token, name: "Marie Kondo", email: "marie@example.com")
             keychainWrite(Storage.stubUserID)
 
             let auth = AuthController()
@@ -697,42 +948,50 @@ struct CredentialHandlingTests {
         }
     }
 
-    @Test("Half an identity is kept as half, not discarded")
+    @Test("Half an identity is kept as half, not discarded",
+          .enabled(if: canSignInLocally, localSessionSkipReason))
     func nameWithoutEmailIsStillAName() async throws {
         try await withCleanAuthState {
-            UserDefaults.standard.set("Marie Kondo", forKey: Storage.nameKey)
-
             let auth = AuthController()
+            let token = establishLocalSession(auth)
+            seedIdentity(token: token, name: "Marie Kondo")
+
             #expect(auth.displayName == "Marie Kondo")
             #expect(auth.email == nil)
             // `AccountSheet.identityIsPartial` turns exactly this into the
             // "Apple shares a name and email only the first time" line.
-            #expect(auth.isStubbedSession == false)
+            #expect(auth.isStubbedSession == canSignInLocally)
         }
     }
 
-    @Test("An email without a name is kept too")
+    @Test("An email without a name is kept too",
+          .enabled(if: canSignInLocally, localSessionSkipReason))
     func emailWithoutNameIsStillAnEmail() async throws {
         try await withCleanAuthState {
-            UserDefaults.standard.set("marie@example.com", forKey: Storage.emailKey)
-
             let auth = AuthController()
+            let token = establishLocalSession(auth)
+            seedIdentity(token: token, email: "marie@example.com")
+
             #expect(auth.email == "marie@example.com")
             #expect(auth.displayName == nil)
             #expect(auth.initials == nil)
         }
     }
 
-    @Test("A Hide-My-Email relay address is stored verbatim")
+    @Test("A Hide-My-Email relay address is stored verbatim",
+          .enabled(if: canSignInLocally, localSessionSkipReason))
     func relayAddressIsNotRewritten() async throws {
         try await withCleanAuthState {
             let relay = "a1b2c3d4e5@privaterelay.appleid.com"
-            UserDefaults.standard.set(relay, forKey: Storage.emailKey)
-            #expect(AuthController().email == relay)
+            let auth = AuthController()
+            let token = establishLocalSession(auth)
+            seedIdentity(token: token, email: relay)
+            #expect(auth.email == relay)
         }
     }
 
-    @Test("No credential, name, email or user ID reaches the console")
+    @Test("No credential, name, email or user ID reaches the console",
+          .enabled(if: canSignInLocally, localSessionSkipReason))
     func nothingSensitiveIsLogged() async throws {
         try await withCleanAuthState {
             let secrets = ["Marie Kondo", "marie.secret@example.com", Storage.stubUserID]
@@ -740,9 +999,8 @@ struct CredentialHandlingTests {
 
             let output = await capturingConsole {
                 let auth = AuthController()
-                UserDefaults.standard.set(secrets[0], forKey: Storage.nameKey)
-                UserDefaults.standard.set(secrets[1], forKey: Storage.emailKey)
-                establishLocalSession(auth)
+                let token = establishLocalSession(auth)
+                seedIdentity(token: token, name: secrets[0], email: secrets[1])
                 auth.setAvatar(picture)
                 await auth.restore()
                 _ = auth.initials
@@ -755,6 +1013,9 @@ struct CredentialHandlingTests {
                 #expect(output.contains(secret) == false,
                         "a credential detail was written to stdout or stderr")
             }
+            // The account token derived from the user ID must not be printed
+            // either — it names a file that is one hash away from the ID.
+            #expect(output.contains(CellarStore.token(for: Storage.stubUserID)) == false)
         }
     }
 }
@@ -765,14 +1026,18 @@ struct CredentialHandlingTests {
 @MainActor
 struct AvatarStorageTests {
 
-    @Test("The picture is written to Application Support, beside the session")
+    @Test("The picture is written to Application Support under this account's name",
+          .enabled(if: canSignInLocally, localSessionSkipReason))
     func avatarLivesInApplicationSupport() async throws {
         try await withCleanAuthState {
             let auth = AuthController()
+            let token = establishLocalSession(auth)
             auth.setAvatar(jpegFixture(300, 200))
 
-            let url = try #require(Storage.avatarURL)
-            #expect(url.lastPathComponent == "avatar.jpg")
+            let url = try #require(Storage.avatarURL(token))
+            #expect(url.lastPathComponent == "avatar-\(token).jpg")
+            // The filename carries the account token, not the Apple user ID.
+            #expect(url.lastPathComponent.contains(Storage.stubUserID) == false)
             #expect(url.path.contains("/Library/Application Support"))
             // Not Caches, which the system may evict, and not Documents,
             // which is user-visible through the Files app.
@@ -783,27 +1048,47 @@ struct AvatarStorageTests {
         }
     }
 
-    @Test("A stored picture is loaded again on the next launch")
+    @Test("Nothing is written while signed out — there is no account to write for")
+    func settingAPictureWhileSignedOutIsANoOp() async throws {
+        try await withCleanAuthState {
+            let auth = AuthController()
+            #expect(auth.state == .signedOut)
+
+            auth.setAvatar(jpegFixture(200, 200))
+
+            #expect(auth.avatar == nil)
+            #expect(Storage.avatarFiles().isEmpty, "a signed-out app wrote a photo to disk")
+        }
+    }
+
+    @Test("A stored picture is loaded again on the next launch",
+          .enabled(if: localSessionAvailable, localSessionSkipReason))
     func avatarSurvivesRelaunch() async throws {
         try await withCleanAuthState {
-            AuthController().setAvatar(jpegFixture(300, 200))
+            let seeder = AuthController()
+            establishLocalSession(seeder)
+            seeder.setAvatar(jpegFixture(300, 200))
 
             let relaunched = AuthController()
+            establishLocalSession(relaunched)
             #expect(relaunched.avatar == nil, "nothing is read until loadAvatar runs")
             relaunched.loadAvatar()
             #expect(relaunched.avatar != nil)
 
-            // And `restore()` is what calls it in the app.
+            // And `restore()` is what calls it in the app — after the session
+            // has been settled, never before.
             let launched = AuthController()
             await launched.restore()
             #expect(launched.avatar != nil)
         }
     }
 
-    @Test("An oversized picture is downscaled before it is kept in memory")
+    @Test("An oversized picture is downscaled before it is kept in memory",
+          .enabled(if: canSignInLocally, localSessionSkipReason))
     func oversizedPictureIsDownscaledInMemory() async throws {
         try await withCleanAuthState {
             let auth = AuthController()
+            establishLocalSession(auth)
             auth.setAvatar(jpegFixture(1024, 768))
 
             let image = try #require(auth.avatar)
@@ -812,10 +1097,12 @@ struct AvatarStorageTests {
         }
     }
 
-    @Test("A picture already smaller than the cap is stored untouched")
+    @Test("A picture already smaller than the cap is stored untouched",
+          .enabled(if: canSignInLocally, localSessionSkipReason))
     func smallPictureIsNotUpscaled() async throws {
         try await withCleanAuthState {
             let auth = AuthController()
+            establishLocalSession(auth)
             auth.setAvatar(jpegFixture(100, 80))
 
             let image = try #require(auth.avatar)
@@ -824,24 +1111,25 @@ struct AvatarStorageTests {
         }
     }
 
-    @Test("FINDING (low): the file on disk is the device scale larger than the 512pt cap")
+    @Test("FINDING (low): the file on disk is the device scale larger than the 512pt cap",
+          .enabled(if: canSignInLocally, localSessionSkipReason))
     func writtenFileIsLargerThanTheCapSuggests() async throws {
         try await withCleanAuthState {
             let auth = AuthController()
+            let token = establishLocalSession(auth)
             auth.setAvatar(jpegFixture(1024, 768))
 
-            let url = try #require(Storage.avatarURL)
+            let url = try #require(Storage.avatarURL(token))
             let data = try Data(contentsOf: url)
             let written = try #require(UIImage(data: data))
 
-            // FINDING (low): AuthController.swift:88 — `downscale` renders
-            // through a `UIGraphicsImageRenderer` with no explicit format, so
-            // it inherits the device scale. `scaled.size` is 512pt as
-            // intended, but `jpegData` writes 512 × scale *pixels*: 1536 px on
-            // a 3x phone, nine times the pixel count the comment at :68-69
-            // sets out to avoid. Visually harmless; the file is simply much
-            // bigger than the code says it is. A format with `scale = 1`
-            // would fix it.
+            // FINDING (low): AuthController's `downscale` renders through a
+            // `UIGraphicsImageRenderer` with no explicit format, so it inherits
+            // the device scale. `scaled.size` is 512pt as intended, but
+            // `jpegData` writes 512 × scale *pixels*: 1536 px on a 3x phone,
+            // nine times the pixel count the comment on `setAvatar` sets out to
+            // avoid. Visually harmless; the file is simply much bigger than the
+            // code says it is. A format with `scale = 1` would fix it.
             #expect(written.size.width == 512 * rendererScale)
             if rendererScale > 1 {
                 #expect(written.size.width > 512)
@@ -851,16 +1139,18 @@ struct AvatarStorageTests {
     }
 
     @Test("A file that is not an image loads as no avatar instead of crashing",
+          .enabled(if: localSessionAvailable, localSessionSkipReason),
           arguments: ["not an image at all",
                       "<?xml version=\"1.0\"?><plist/>",
                       "\u{0}\u{1}\u{2}\u{3}",
                       "GIF89a"])
     func corruptAvatarFileLoadsAsNil(_ junk: String) async throws {
         try await withCleanAuthState {
-            let url = try #require(Storage.avatarURL)
+            let auth = AuthController()
+            let token = establishLocalSession(auth)
+            let url = try #require(Storage.avatarURL(token))
             try Data(junk.utf8).write(to: url, options: .atomic)
 
-            let auth = AuthController()
             auth.loadAvatar()
             #expect(auth.avatar == nil)
 
@@ -870,14 +1160,16 @@ struct AvatarStorageTests {
         }
     }
 
-    @Test("A truncated JPEG does not crash the loader")
+    @Test("A truncated JPEG does not crash the loader",
+          .enabled(if: canSignInLocally, localSessionSkipReason))
     func truncatedJpegIsSurvivable() async throws {
         try await withCleanAuthState {
+            let auth = AuthController()
+            let token = establishLocalSession(auth)
             let full = jpegFixture(400, 400)
-            let url = try #require(Storage.avatarURL)
+            let url = try #require(Storage.avatarURL(token))
             try full.prefix(full.count / 3).write(to: url, options: .atomic)
 
-            let auth = AuthController()
             auth.loadAvatar()
             // UIImage may decode a partial JPEG or refuse it — either is
             // acceptable, a crash is not. Whichever it does, it must do it
@@ -886,6 +1178,7 @@ struct AvatarStorageTests {
             // and a placeholder across launches.
             let first = auth.avatar != nil
             let second = AuthController()
+            establishLocalSession(second)
             second.loadAvatar()
             #expect((second.avatar != nil) == first)
 
@@ -898,33 +1191,39 @@ struct AvatarStorageTests {
         }
     }
 
-    @Test("An empty avatar file loads as no avatar")
+    @Test("An empty avatar file loads as no avatar",
+          .enabled(if: canSignInLocally, localSessionSkipReason))
     func emptyAvatarFileIsNil() async throws {
         try await withCleanAuthState {
-            let url = try #require(Storage.avatarURL)
+            let auth = AuthController()
+            let token = establishLocalSession(auth)
+            let url = try #require(Storage.avatarURL(token))
             try Data().write(to: url, options: .atomic)
 
-            let auth = AuthController()
             auth.loadAvatar()
             #expect(auth.avatar == nil)
         }
     }
 
-    @Test("Loading with no file at all is not an error")
+    @Test("Loading with no file at all is not an error",
+          .enabled(if: canSignInLocally, localSessionSkipReason))
     func missingAvatarFileIsNil() async throws {
         try await withCleanAuthState {
             let auth = AuthController()
+            establishLocalSession(auth)
             auth.loadAvatar()
             #expect(auth.avatar == nil)
         }
     }
 
-    @Test("Setting a non-image keeps the picture that was already there")
+    @Test("Setting a non-image keeps the picture that was already there",
+          .enabled(if: canSignInLocally, localSessionSkipReason))
     func settingJunkDoesNotDestroyTheStoredPicture() async throws {
         try await withCleanAuthState {
             let auth = AuthController()
+            let token = establishLocalSession(auth)
             auth.setAvatar(jpegFixture(200, 200))
-            let url = try #require(Storage.avatarURL)
+            let url = try #require(Storage.avatarURL(token))
             let good = try Data(contentsOf: url)
 
             auth.setAvatar(Data("this is not a picture".utf8))
@@ -938,12 +1237,14 @@ struct AvatarStorageTests {
         }
     }
 
-    @Test("Clearing removes the file, and clearing again is harmless")
+    @Test("Clearing removes the file, and clearing again is harmless",
+          .enabled(if: canSignInLocally, localSessionSkipReason))
     func clearAvatarDeletesTheFile() async throws {
         try await withCleanAuthState {
             let auth = AuthController()
+            let token = establishLocalSession(auth)
             auth.setAvatar(jpegFixture(200, 200))
-            let url = try #require(Storage.avatarURL)
+            let url = try #require(Storage.avatarURL(token))
             #expect(FileManager.default.fileExists(atPath: url.path))
 
             auth.clearAvatar()
@@ -955,23 +1256,21 @@ struct AvatarStorageTests {
         }
     }
 
-    @Test("Replacing a picture leaves one file, holding the newer image")
+    @Test("Replacing a picture leaves one file, holding the newer image",
+          .enabled(if: canSignInLocally, localSessionSkipReason))
     func replacingAPictureOverwritesInPlace() async throws {
         try await withCleanAuthState {
             let auth = AuthController()
+            let token = establishLocalSession(auth)
             auth.setAvatar(jpegFixture(200, 200))
             auth.setAvatar(jpegFixture(400, 100))
 
-            let url = try #require(Storage.avatarURL)
+            let url = try #require(Storage.avatarURL(token))
             let stored = try #require(UIImage(data: try Data(contentsOf: url)))
             #expect(stored.size.width > stored.size.height, "the second picture is the wide one")
 
-            let directory = url.deletingLastPathComponent()
-            let jpegs = try FileManager.default
-                .contentsOfDirectory(atPath: directory.path)
-                .filter { $0.hasSuffix(".jpg") }
-                .sorted()
-            #expect(jpegs == ["avatar.jpg"], "no orphaned copies accumulate")
+            let files = Storage.avatarFiles().map(\.lastPathComponent).sorted()
+            #expect(files == ["avatar-\(token).jpg"], "no orphaned copies accumulate")
         }
     }
 }
@@ -981,14 +1280,20 @@ struct AvatarStorageTests {
 /// `initials` renders inside `AvatarView`, on the header and on the account
 /// sheet. A trap here is a crash on a screen the user reaches by tapping their
 /// own face, so the inputs below are deliberately unpleasant.
+///
+/// Every case needs a signed-in account: the name is read from that account's
+/// bucket, so a signed-out controller would answer nil to all of them and the
+/// whole suite would pass without touching the logic.
 @Suite("Initials · derived from whatever name is on file", .serialized)
 @MainActor
 struct InitialsTests {
 
     private func initials(for name: String?) -> String? {
-        if let name { UserDefaults.standard.set(name, forKey: Storage.nameKey) }
-        else { UserDefaults.standard.removeObject(forKey: Storage.nameKey) }
-        return AuthController().initials
+        let auth = AuthController()
+        let token = establishLocalSession(auth)
+        if let name { UserDefaults.standard.set(name, forKey: Storage.nameKey(token)) }
+        else { UserDefaults.standard.removeObject(forKey: Storage.nameKey(token)) }
+        return auth.initials
     }
 
     @Test("Two names give two letters, uppercased")
@@ -1083,15 +1388,15 @@ struct InitialsTests {
           arguments: ["\t", "\n", "\u{00A0}", "\u{2007}", "\t\n"])
     func nonAsciiWhitespaceProducesABlankInitial(_ name: String) async throws {
         try await withCleanAuthState {
-            // FINDING (low): AuthController.swift:99-100 — the name is split on
-            // the literal " " only, and the emptiness test is
-            // `letters.isEmpty`, so a name made of a tab, a newline or a
-            // non-breaking space produces a non-nil string holding one
-            // whitespace character. `AvatarView` (Views/Components/Avatar.swift:16)
-            // checks `!initials.isEmpty`, which that passes, so the avatar
-            // draws an empty tinted circle instead of falling back to the
-            // neutral person symbol. Splitting on `.whitespacesAndNewlines`
-            // and rejecting a blank result would close it.
+            // FINDING (low): AuthController's `initials` splits the name on the
+            // literal " " only, and the emptiness test is `letters.isEmpty`, so
+            // a name made of a tab, a newline or a non-breaking space produces
+            // a non-nil string holding one whitespace character. `AvatarView`
+            // (Views/Components/Avatar.swift:16) checks `!initials.isEmpty`,
+            // which that passes, so the avatar draws an empty tinted circle
+            // instead of falling back to the neutral person symbol. Splitting
+            // on `.whitespacesAndNewlines` and rejecting a blank result would
+            // close it.
             let result = initials(for: name)
             #expect(result != nil, "asserted as it is: whitespace survives as an initial")
             #expect(result?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == true)
@@ -1101,7 +1406,7 @@ struct InitialsTests {
     @Test("FINDING (low): a name beginning with ß yields three characters, not two")
     func sharpSUppercasesToTwoLetters() async throws {
         try await withCleanAuthState {
-            // FINDING (low): AuthController.swift:99-100 — `prefix(2)` caps the
+            // FINDING (low): AuthController's `initials` — `prefix(2)` caps the
             // number of *source* letters, then `.uppercased()` runs on the
             // joined string. German ß uppercases to "SS", so two name parts
             // can produce a three- or four-character initial inside a fixed
@@ -1111,16 +1416,344 @@ struct InitialsTests {
         }
     }
 
-    @Test("The initials follow the stored name, and disappear with it")
+    @Test("The initials follow the stored name, and are unreadable once signed out",
+          .enabled(if: canSignInLocally, localSessionSkipReason))
     func initialsTrackTheStoredName() async throws {
         try await withCleanAuthState {
             let auth = AuthController()
-            UserDefaults.standard.set("Marie Kondo", forKey: Storage.nameKey)
+            let token = establishLocalSession(auth)
+            seedIdentity(token: token, name: "Marie Kondo")
             #expect(auth.initials == "MK")
 
             auth.signOut()
-            #expect(auth.initials == nil, "no initials survive sign-out")
+            // The name is still on disk — sign-out keeps it — but there is no
+            // signed-in account to read it for.
+            #expect(auth.initials == nil, "no initials are readable while signed out")
+            #expect(UserDefaults.standard.string(forKey: Storage.nameKey(token)) == "Marie Kondo")
         }
+    }
+}
+
+// MARK: - Account isolation
+
+/// The point of the per-account store: one Apple ID's cellar, name, email and
+/// photograph are not merely hidden from another's, they are in different files
+/// and different keys. A shared store filtered by an owner column would be one
+/// forgotten predicate away from showing someone else's bottles; these tests
+/// assert the stronger property, that the container a signed-in account holds
+/// is not attached to anyone else's file at all.
+///
+/// Every account used here is invented for the test and its store is removed
+/// afterwards — nothing is left in Application Support.
+@Suite("Account isolation · one cellar, one identity, per account", .serialized)
+@MainActor
+struct AccountIsolationTests {
+
+    private static let schema = Schema([Wine.self, TastingNote.self])
+
+    /// An account ID no real device could produce, unique per call so two runs
+    /// never collide over the same file.
+    private func temporaryAccountID(_ label: String) -> String {
+        "vinnota.tests.\(label).\(UUID().uuidString)"
+    }
+
+    /// Removes an account's store and everything SwiftData put beside it: the
+    /// SQLite sidecars, any quarantined copy, and the hidden
+    /// `.cellar-<token>.store_SUPPORT` directory the coordinator creates for
+    /// external-storage blobs. Matching on the bare `cellar-` prefix alone
+    /// leaves that directory behind, which is how this suite would slowly fill
+    /// Application Support with debris.
+    private func removeStore(for accountID: String) {
+        let token = CellarStore.token(for: accountID)
+        let stem = Storage.storePrefix + token
+        guard let dir = Storage.supportDirectory,
+              let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path)
+        else { return }
+        for name in names where name.hasPrefix(stem) || name.hasPrefix("." + stem) {
+            try? FileManager.default.removeItem(at: dir.appendingPathComponent(name))
+        }
+    }
+
+    /// Everything in Application Support belonging to this account, by any
+    /// name — used to prove the cleanup above actually cleans up.
+    private func residue(of accountID: String) -> [String] {
+        let token = CellarStore.token(for: accountID)
+        guard let dir = Storage.supportDirectory,
+              let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path)
+        else { return [] }
+        return names.filter { $0.contains(token) }.sorted()
+    }
+
+    /// Runs `body` with freshly invented accounts and cleans their files up.
+    private func withTemporaryAccounts(
+        _ labels: [String], _ body: ([String]) throws -> Void
+    ) rethrows {
+        let ids = labels.map(temporaryAccountID)
+        defer { for id in ids { removeStore(for: id) } }
+        try body(ids)
+    }
+
+    /// A container opened on one account's real store file, the same way
+    /// `CellarStore` opens it.
+    private func container(for accountID: String) throws -> ModelContainer {
+        let url = try #require(CellarStore.storeURL(for: accountID))
+        return try ModelContainer(
+            for: Self.schema,
+            configurations: [ModelConfiguration(schema: Self.schema, url: url)]
+        )
+    }
+
+    private func bottle(_ name: String) -> Wine {
+        Wine(producer: "Giuseppe Rinaldi", name: name, vintage: "2019",
+             region: "Barolo", grape: "Nebbiolo", shop: "Enoteca Sciolla")
+    }
+
+    private func wines(in container: ModelContainer) throws -> [Wine] {
+        // A fresh context, so what comes back is a genuine read of the store
+        // rather than the instance a writing context still holds in memory.
+        try ModelContext(container).fetch(FetchDescriptor<Wine>())
+    }
+
+    // MARK: Naming
+
+    @Test("Two accounts get two tokens, two store files and two sets of identity keys")
+    func differentAccountsAreNamedDifferently() throws {
+        try withTemporaryAccounts(["a", "b"]) { ids in
+            let (a, b) = (ids[0], ids[1])
+            let tokenA = CellarStore.token(for: a)
+            let tokenB = CellarStore.token(for: b)
+
+            #expect(tokenA != tokenB)
+
+            let urlA = try #require(CellarStore.storeURL(for: a))
+            let urlB = try #require(CellarStore.storeURL(for: b))
+            #expect(urlA != urlB)
+            #expect(urlA.lastPathComponent == "cellar-\(tokenA).store")
+            #expect(urlB.lastPathComponent == "cellar-\(tokenB).store")
+            // Same directory, different files — the separation is the filename,
+            // not a chance difference of location.
+            #expect(urlA.deletingLastPathComponent() == urlB.deletingLastPathComponent())
+
+            #expect(Storage.nameKey(tokenA) != Storage.nameKey(tokenB))
+            #expect(Storage.emailKey(tokenA) != Storage.emailKey(tokenB))
+            #expect(Storage.avatarURL(tokenA) != Storage.avatarURL(tokenB))
+
+            // And none of them collide with the signed-out bucket.
+            for token in [tokenA, tokenB] {
+                #expect(token != Storage.signedOutToken)
+            }
+        }
+    }
+
+    @Test("The same account always yields the same token, and the token is not the user ID")
+    func tokenIsStableAndDoesNotLeakTheAppleIdentifier() throws {
+        // Shaped like the identifier Apple actually returns.
+        let appleID = "001234.9f8e7d6c5b4a39281706abcdef012345.1122"
+        let token = CellarStore.token(for: appleID)
+
+        // Stability: the token is derived, not generated, so a relaunch — or a
+        // reinstall that keeps Application Support — finds the same file.
+        #expect(CellarStore.token(for: appleID) == token)
+        #expect(CellarStore.token(for: appleID) == CellarStore.token(for: appleID))
+
+        // Shape: 16 lowercase hex characters, safe in a filename on any volume.
+        #expect(token.count == 16)
+        #expect(token.allSatisfy { $0.isHexDigit && !$0.isUppercase })
+
+        // The identifier itself never reaches the filesystem: it is an account
+        // identifier, and a filename shows up in backups, crash reports and
+        // file listings.
+        #expect(token != appleID)
+        #expect(appleID.contains(token) == false)
+        #expect(token.contains(appleID) == false)
+        let url = try #require(CellarStore.storeURL(for: appleID))
+        #expect(url.path.contains(appleID) == false)
+        #expect(url.lastPathComponent.contains(token))
+        #expect(Storage.nameKey(token).contains(appleID) == false)
+        #expect(Storage.avatarFilename(token).contains(appleID) == false)
+
+        // A one-character difference gives an unrelated token, so neighbouring
+        // Apple IDs cannot land on the same file.
+        #expect(CellarStore.token(for: "001234.9f8e7d6c5b4a39281706abcdef012345.1123") != token)
+
+        // No account is its own bucket, and an empty string is not an account.
+        #expect(CellarStore.token(for: nil) == Storage.signedOutToken)
+        #expect(CellarStore.token(for: "") == Storage.signedOutToken)
+        #expect(CellarStore.token(for: appleID) != Storage.signedOutToken)
+    }
+
+    @Test("Identity written for one account is invisible to every other account")
+    func identityKeysAreScopedPerAccount() async throws {
+        try await withCleanAuthState {
+            let tokenA = CellarStore.token(for: "isolation.account.a")
+            let tokenB = CellarStore.token(for: "isolation.account.b")
+
+            seedIdentity(token: tokenA, name: "Marie Kondo", email: "marie@example.com")
+            _ = plantAvatar(jpegFixture(80, 80), token: tokenA)
+
+            // Account B's bucket was never written to.
+            #expect(UserDefaults.standard.string(forKey: Storage.nameKey(tokenB)) == nil)
+            #expect(UserDefaults.standard.string(forKey: Storage.emailKey(tokenB)) == nil)
+            let bAvatar = try #require(Storage.avatarURL(tokenB))
+            #expect(FileManager.default.fileExists(atPath: bAvatar.path) == false)
+
+            // Nor did the write reach the signed-out bucket, which is what a
+            // controller falls back to when no one is signed in.
+            #expect(UserDefaults.standard.string(forKey: Storage.nameKey(Storage.signedOutToken)) == nil)
+
+            // A running controller signed in as somebody else entirely sees
+            // none of it.
+            let auth = AuthController()
+            let token = establishLocalSession(auth)
+            #expect(token != tokenA)
+            #expect(auth.displayName == nil)
+            #expect(auth.email == nil)
+            #expect(auth.initials == nil)
+            auth.loadAvatar()
+            #expect(auth.avatar == nil)
+        }
+    }
+
+    // MARK: The cellar itself
+
+    @Test("Bottles saved under one account's store are not visible from another's")
+    func bottlesDoNotCrossBetweenAccounts() throws {
+        try withTemporaryAccounts(["owner", "stranger"]) { ids in
+            let (owner, stranger) = (ids[0], ids[1])
+
+            let ownersStore = try container(for: owner)
+            let strangersStore = try container(for: stranger)
+
+            let write = ModelContext(ownersStore)
+            write.insert(bottle("Brunate"))
+            write.insert(bottle("Cannubi"))
+            try write.save()
+
+            // The owner sees exactly what was written.
+            let mine = try wines(in: ownersStore)
+            #expect(mine.count == 2)
+            #expect(Set(mine.map(\.name)) == ["Brunate", "Cannubi"])
+
+            // The other account's container is attached to a different file, so
+            // there is nothing to filter and nothing to leak.
+            let theirs = try wines(in: strangersStore)
+            #expect(theirs.isEmpty, "another account's bottles are visible")
+            #expect(theirs.contains { $0.name == "Brunate" } == false)
+
+            // Both files really exist and really are different files.
+            let ownerURL = try #require(CellarStore.storeURL(for: owner))
+            let strangerURL = try #require(CellarStore.storeURL(for: stranger))
+            #expect(ownerURL != strangerURL)
+            #expect(FileManager.default.fileExists(atPath: ownerURL.path))
+
+            // And writing as the stranger does not reach back into the owner's.
+            let strangerWrite = ModelContext(strangersStore)
+            strangerWrite.insert(bottle("Barbaresco"))
+            try strangerWrite.save()
+            #expect(try wines(in: ownersStore).count == 2)
+            #expect(try wines(in: strangersStore).map(\.name) == ["Barbaresco"])
+        }
+    }
+
+    @Test("Signing out and back in as the same account still sees its bottles")
+    func theSameAccountKeepsItsBottlesAcrossSignOut() throws {
+        try withTemporaryAccounts(["returning"]) { ids in
+            let account = ids[0]
+
+            let store = CellarStore()
+            #expect(store.identity == Storage.signedOutToken)
+
+            store.open(for: account)
+            #expect(store.identity == CellarStore.token(for: account))
+            #expect(store.failure == nil)
+
+            let write = ModelContext(store.container)
+            write.insert(bottle("Brunate"))
+            try write.save()
+
+            // Sign out — which is where the old behaviour destroyed things.
+            store.open(for: nil)
+            #expect(store.identity == Storage.signedOutToken)
+
+            // And back in as the same account.
+            store.open(for: account)
+            let kept = try wines(in: store.container)
+            #expect(kept.count == 1)
+            #expect(kept.first?.name == "Brunate")
+            #expect(store.failure == nil)
+        }
+    }
+
+    @Test("The signed-out state opens an empty store, holding nobody's bottles")
+    func theSignedOutStoreIsEmpty() throws {
+        try withTemporaryAccounts(["first", "second"]) { ids in
+            let (first, second) = (ids[0], ids[1])
+
+            let store = CellarStore()
+            store.open(for: first)
+            let writeFirst = ModelContext(store.container)
+            writeFirst.insert(bottle("Brunate"))
+            try writeFirst.save()
+
+            store.open(for: second)
+            let writeSecond = ModelContext(store.container)
+            writeSecond.insert(bottle("Cannubi"))
+            try writeSecond.save()
+
+            store.open(for: nil)
+            #expect(store.identity == Storage.signedOutToken)
+            #expect(try wines(in: store.container).isEmpty,
+                    "a signed-out app is showing an account's cellar")
+
+            // Nothing entered while signed out reaches either account's file:
+            // the signed-out container is in memory only.
+            let orphan = ModelContext(store.container)
+            orphan.insert(bottle("Ghost"))
+            try orphan.save()
+
+            store.open(for: first)
+            #expect(try wines(in: store.container).map(\.name) == ["Brunate"])
+            store.open(for: second)
+            #expect(try wines(in: store.container).map(\.name) == ["Cannubi"])
+        }
+    }
+
+    @Test("Re-opening the account already open does not tear the store down")
+    func openingTheSameAccountTwiceIsANoOp() {
+        withTemporaryAccounts(["stable"]) { ids in
+            let account = ids[0]
+            let store = CellarStore()
+            store.open(for: account)
+
+            let first = store.container
+            store.open(for: account)
+
+            // The view tree is rebuilt off `identity`; swapping the container
+            // for an identical one would throw away every `@Query` for nothing.
+            #expect(store.container === first)
+            #expect(store.identity == CellarStore.token(for: account))
+        }
+    }
+
+    @Test("Every store file these tests create is cleaned up again")
+    func temporaryStoresAreRemoved() throws {
+        var url: URL?
+        var account: String?
+        try withTemporaryAccounts(["swept"]) { ids in
+            account = ids[0]
+            url = CellarStore.storeURL(for: ids[0])
+            let write = ModelContext(try container(for: ids[0]))
+            write.insert(bottle("Brunate"))
+            try write.save()
+            #expect(FileManager.default.fileExists(atPath: try #require(url).path))
+            #expect(residue(of: ids[0]).isEmpty == false)
+        }
+        // `withTemporaryAccounts` removed it on the way out — this suite adds
+        // nothing permanent to Application Support, sidecars and SwiftData's
+        // hidden `_SUPPORT` directory included.
+        #expect(FileManager.default.fileExists(atPath: try #require(url).path) == false)
+        #expect(residue(of: try #require(account)).isEmpty,
+                "a temporary account left files behind in Application Support")
     }
 }
 

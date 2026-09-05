@@ -87,6 +87,25 @@ The form's commit path lives on `WineForm` (`makeWine`, `apply(to:)`,
 `makeNotes`) rather than inside `ReviewView.save()`, so it is reachable from
 tests. It was inlined once, and a mutation dropping `.trimmed` went undetected.
 
+## The cellar is scoped to the account
+
+Each account gets its own store file, `Application Support/cellar-<token>.store`,
+where the token is SHA256 of Apple's user identifier truncated to 16 hex chars —
+hashed because an account identifier has no business sitting in a filename that
+appears in backups and crash reports. `CellarStore` owns this, along with the
+quarantine/recovery path that used to be private inside the `App` struct.
+
+Isolation is by construction, not by filtering: a signed-in account cannot reach
+another's bottles because the container it holds is not attached to their file.
+The alternative — one store with an owner column and a predicate on every query —
+is one forgotten filter away from showing someone else's cellar.
+
+Identity is scoped the same way (`com.vinnota.displayName.<token>`,
+`avatar-<token>.jpg`). Signing out ends the session and keeps the account's data;
+`forgetThisAccount()` is the destructive one. That matters because Apple supplies
+`fullName` and `email` exactly once per Apple ID, so deleting them on sign-out
+made a returning user permanently nameless.
+
 ## What is real, not simulated
 
 The design fakes its scanner (a 1.6s delay and canned text) and its
