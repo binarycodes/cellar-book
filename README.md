@@ -1,106 +1,72 @@
-# Vinnota — Cellar Book
+# Cellar Book
 
-A native iOS app built from the Claude Design project
-`Vinnota - Cellar Book.dc.html`. Scan a wine label on the shelf, keep the note,
-record what the bottle did in the glass.
+A wine notebook for your phone. Point it at a label in the shop, keep the
+bottle, and remember what it was actually like when you opened it.
 
-SwiftUI · iOS 17+ · SwiftData · Vision · Speech · AVFoundation
-
----
-
-## Status
-
-**Builds and runs.** Verified on Xcode 26.6 / iOS 26.5, iPhone 17 Pro
-simulator, 2026-09-05. The full flow was exercised: sign in, scan a label
-through Vision OCR, correct and file it, set keenness, record a purchase,
-taste it with a verdict, search, and delete.
-
-Two things are **not** verified, both for want of hardware:
-- **The camera path.** No camera on this host, so scanning was tested through
-  the photo-library fallback — same OCR code, different image source.
-- **Dictation.** The Simulator cannot open an audio input on this virtualised
-  host, so `SpeechTranscriber` refuses there rather than letting AudioToolbox
-  abort the process. Needs a real device.
-
-See [OPEN-QUESTIONS.md](OPEN-QUESTIONS.md) for both, plus the missing login
-photograph and the decisions taken along the way.
-
-```bash
-open Vinnota.xcodeproj
-```
-
-Or from the command line:
-
-```bash
-xcodebuild -scheme Vinnota -destination 'platform=iOS Simulator,name=iPhone 17 Pro' build
-```
+Made for the moment you are standing in an aisle holding something you have
+never heard of, trying to decide.
 
 ---
 
-## The screens
+## What it does
 
-Seven states on one surface, mirroring the design's single `screen` variable
-rather than a navigation stack — every screen paints its own chrome.
+**Scan a label.** Photograph the bottle and the producer, year, grape and
+region are read off it for you. Correct anything it got wrong — labels are
+hard to read, and it will not always get them right.
 
-| Screen | File | What it does |
-|---|---|---|
-| Login | `LoginView` | Sign in with Apple, with a local stub fallback |
-| Cellar | `CellarView` | Two-column grid, three stats, six filter tabs |
-| Search | `SearchView` | Live filter over producer, cuvée, region, grape, shop |
-| Scan | `ScanView` | Live camera + Vision OCR, photo-library fallback |
-| Review | `ReviewView` | Correct what OCR read, then file the bottle |
-| Detail | `DetailView` | Hero, facts, provenance timeline, notes |
-| Tasting | `TastingView` | Photograph the pour, note it, pick a verdict |
+**Or just type it in.** No camera, no signal, no patience: enter the name and
+you are done. Everything else can wait, and you can add a label photo later.
 
-Plus four overlays: dictation, currency picker, purchase, and delete
-confirmation — with a toast for confirmations.
+**Say how keen you are.** Want to try, undecided, or pass. The passes matter as
+much as the wants — that is how you stop buying the same disappointing bottle
+twice.
 
-## The model
+**Keep a note.** Type it, or dictate it if your hands are full. What the
+shopkeeper said, who recommended it, why you picked it up.
 
-A bottle moves `new → want / maybe / not → bought → tasted`. Prices are dual:
-the shelf price seen when scanned, and what was actually paid. Notes are split
-`pre` (before opening) and `post` (in the glass), each either typed or
-dictated. Tasted bottles cannot be deleted — they stay on the record.
+**Record the bottle you bought.** What you paid, how many, and where — which is
+rarely what the shelf said.
 
-## What is real, not simulated
+**Taste it.** Photograph the glass, write what it was like, and give it a
+verdict. Loved, fine, or no.
 
-The design fakes its scanner (a 1.6s delay and canned text) and its
-transcription. Both are real here:
+**Find it again.** Search across producer, cuvée, region, grape and shop, or
+filter the shelf by where each bottle has got to.
 
-- **`LabelScanner`** — `VNRecognizeTextRequest` at `.accurate`, five languages,
-  language correction off since labels are proper nouns. Fields are assigned by
-  heuristic: the tallest text is the producer, a four-digit year in range is the
-  vintage, and grape/region are matched against built-in lists. Boilerplate
-  ("contains sulfites", "75cl", appellation legalese) is filtered out.
-- **`SpeechTranscriber`** — `SFSpeechRecognizer` with
-  `requiresOnDeviceRecognition`, honouring the design's on-device promise. The
-  waveform is driven by real RMS levels off the audio buffer, not an animation.
-- **`CameraController`** — `AVCaptureSession` with continuous autofocus. The
-  simulator has no camera, so `isAvailable` is false there and the scan screen
-  offers `PhotosPicker` into the identical OCR path.
+## Your cellar stays on your phone
 
-## Design fidelity
+The book is stored on your device. There is no account to create beyond signing
+in, nothing is uploaded, and no one else can see what you drink.
 
-Colours, type sizes, tracking, spacing and radii are transcribed from the
-`.dc.html` rather than approximated. The palette lives in `Theme/Palette.swift`
-with the source values in comments.
+Two things to know:
 
-Instrument Sans ships as a **variable** font, and iOS will not interpolate a
-variable axis — `UIFont(name:size:)` always returns the default instance. So
-weights are produced by driving the `wght` axis through CoreText
-(`Theme/Typography.swift`). Instrument Serif is bundled as static regular and
-italic faces from Google Fonts (OFL).
+- **It is not backed up anywhere by us.** Your cellar rides along in your normal
+  encrypted iPhone backup. Without one, losing the phone loses the book.
+- **Dictation uses Apple's speech recognition.** On many phones that happens on
+  the device; where it cannot, Apple transcribes it. Either way the finished
+  note is kept on your phone and nowhere else.
 
-## Layout
+## Getting it running
 
-```
-Vinnota/
-  Theme/       Palette, Typography
-  Model/       Wine, TastingNote, enums, AppState, Settings, Formatters
-  Services/    AuthController, CameraController, LabelScanner, SpeechTranscriber
-  Views/       one file per screen, Sheets/, Components/
-  Resources/   bundled fonts
-```
+Requires an iPhone or iPad on **iOS 17 or later**.
 
-`Vinnota.xcodeproj` uses a file-system-synchronized group (`objectVersion 77`),
-so adding a Swift file to `Vinnota/` is enough — no project edit needed.
+Open `Vinnota.xcodeproj` in Xcode, pick your device, and press run. Building to
+a real iPhone needs a free Apple ID — [TESTING.md](TESTING.md) walks through the
+signing set-up and what to try once it is installed.
+
+## Known gaps
+
+Being straight about what is not there yet:
+
+- **No export.** The only copy is on the phone.
+- **The camera and dictation are unverified on real hardware.** They are written
+  and wired up, but the development machine has neither, so they have only been
+  exercised through the photo library and a simulator.
+- **One cellar per device.** Signing out leaves the bottles behind, so a second
+  person on the same phone sees the first person's book.
+- **English only, and no accessibility work yet** — text does not respond to
+  Larger Text, and there are no VoiceOver labels.
+
+---
+
+Contributing or looking at the code? See [CLAUDE.md](CLAUDE.md).
