@@ -35,11 +35,18 @@ final class AuthController: NSObject {
     /// Apple returns `fullName` and `email` only on the FIRST authorization for
     /// a given Apple ID — every later sign-in leaves them nil. They are stored
     /// here at that one opportunity, or the account is nameless forever after.
-    private static let nameKey = "com.vinnota.displayName"
-    private static let emailKey = "com.vinnota.email"
+    /// Identity is stored per account. A second Apple ID on the same device
+    /// must not see the first one's name, email or picture, and the store is
+    /// scoped the same way — see `CellarStore`.
+    private static func nameKey(_ token: String) -> String { "com.vinnota.displayName.\(token)" }
+    private static func emailKey(_ token: String) -> String { "com.vinnota.email.\(token)" }
 
-    var displayName: String? { UserDefaults.standard.string(forKey: Self.nameKey) }
-    var email: String? { UserDefaults.standard.string(forKey: Self.emailKey) }
+    /// The account whose identity is currently readable. Signed out, this is
+    /// the "signed-out" bucket, which nothing ever writes to.
+    private var accountToken: String { CellarStore.token(for: state.accountID) }
+
+    var displayName: String? { UserDefaults.standard.string(forKey: Self.nameKey(accountToken)) }
+    var email: String? { UserDefaults.standard.string(forKey: Self.emailKey(accountToken)) }
 
     /// A profile picture the user chose.
     ///
@@ -49,15 +56,20 @@ final class AuthController: NSObject {
     /// own, stored on this device beside the session and cleared with it.
     private(set) var avatar: UIImage?
 
-    private static var avatarURL: URL? {
+    private static func avatarURL(_ token: String) -> URL? {
         try? FileManager.default.url(for: .applicationSupportDirectory,
                                      in: .userDomainMask,
                                      appropriateFor: nil, create: true)
-            .appendingPathComponent("avatar.jpg")
+            .appendingPathComponent("avatar-\(token).jpg")
     }
 
+    /// Only ever loads the signed-in account's picture. Signed out there is no
+    /// account to load one for, so nothing is read — which is also why this
+    /// must not be called before the session has been established.
     func loadAvatar() {
-        guard let url = Self.avatarURL, let data = try? Data(contentsOf: url) else {
+        guard case .signedIn = state,
+              let url = Self.avatarURL(accountToken),
+              let data = try? Data(contentsOf: url) else {
             avatar = nil
             return
         }
@@ -70,13 +82,14 @@ final class AuthController: NSObject {
         guard let image = UIImage(data: data),
               let scaled = Self.downscale(image, to: 512),
               let jpeg = scaled.jpegData(compressionQuality: 0.85),
-              let url = Self.avatarURL else { return }
+              case .signedIn = state,
+              let url = Self.avatarURL(accountToken) else { return }
         try? jpeg.write(to: url, options: .atomic)
         avatar = scaled
     }
 
     func clearAvatar() {
-        if let url = Self.avatarURL { try? FileManager.default.removeItem(at: url) }
+        if let url = Self.avatarURL(accountToken) { try? FileManager.default.removeItem(at: url) }
         avatar = nil
     }
 
@@ -104,9 +117,15 @@ final class AuthController: NSObject {
 
     /// Re-establishes the session on launch. Apple can revoke a credential out
     /// of band, so a stored ID is verified before it is trusted.
+    /// The picture is loaded only after the session has been established, and
+    /// only for the account that owns it. Loading it first meant a rejected
+    /// session had already decoded the previous user's photo into memory.
     func restore() async {
-        loadAvatar()
-        guard let stored = Self.readKeychain() else { return }
+        guard let stored = Self.readKeychain() else {
+            state = .signedOut
+            loadAvatar()
+            return
+        }
 
         if stored == Self.stubUserID {
             #if DEBUG
@@ -116,6 +135,7 @@ final class AuthController: NSObject {
             Self.deleteKeychain()
             state = .signedOut
             #endif
+            loadAvatar()
             return
         }
         let provider = ASAuthorizationAppleIDProvider()
@@ -127,29 +147,51 @@ final class AuthController: NSObject {
             Self.deleteKeychain()
             state = .signedOut
         }
+        loadAvatar()
     }
 
+    /// Ends the session without destroying the account's data.
+    ///
+    /// The name, email, picture and cellar stay on disk under this account's
+    /// own keys, so signing back in restores them — which matters because Apple
+    /// hands over `fullName` and `email` exactly once, and deleting them made a
+    /// returning user permanently nameless. Another account signing in reads a
+    /// different set of keys and a different store file, so nothing here is
+    /// visible to them.
     func signOut() {
         Self.deleteKeychain()
-        // The name and email are dropped with the session. Apple will not hand
-        // them over again on a later sign-in, so a returning user shows as
-        // nameless — that is Apple's behaviour, not a bug here.
-        UserDefaults.standard.removeObject(forKey: Self.nameKey)
-        UserDefaults.standard.removeObject(forKey: Self.emailKey)
-        clearAvatar()
+        avatar = nil
         state = .signedOut
+    }
+
+    /// Erases everything belonging to the signed-in account: the picture, the
+    /// stored identity and the cellar file. Separate from `signOut` because
+    /// signing out and deleting your data are different intentions.
+    func forgetThisAccount() {
+        guard let accountID = state.accountID else { return }
+        let token = CellarStore.token(for: accountID)
+        if let url = Self.avatarURL(token) { try? FileManager.default.removeItem(at: url) }
+        UserDefaults.standard.removeObject(forKey: Self.nameKey(token))
+        UserDefaults.standard.removeObject(forKey: Self.emailKey(token))
+        if let store = CellarStore.storeURL(for: accountID) {
+            for suffix in ["", "-shm", "-wal"] {
+                try? FileManager.default.removeItem(atPath: store.path + suffix)
+            }
+        }
+        signOut()
     }
 
     /// Captures whatever Apple chose to share, at the only moment it is offered.
     private static func storeIdentity(from credential: ASAuthorizationAppleIDCredential) {
+        let token = CellarStore.token(for: credential.user)
         if let name = credential.fullName {
             let formatter = PersonNameComponentsFormatter()
             formatter.style = .default
             let formatted = formatter.string(from: name).trimmingCharacters(in: .whitespaces)
-            if !formatted.isEmpty { UserDefaults.standard.set(formatted, forKey: nameKey) }
+            if !formatted.isEmpty { UserDefaults.standard.set(formatted, forKey: nameKey(token)) }
         }
         if let email = credential.email, !email.isEmpty {
-            UserDefaults.standard.set(email, forKey: emailKey)
+            UserDefaults.standard.set(email, forKey: emailKey(token))
         }
     }
 
