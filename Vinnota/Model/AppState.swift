@@ -37,7 +37,19 @@ final class AppState {
     var tasting = TastingForm()
 
     var toast: String?
-    private var toastTask: Task<Void, Never>?
+
+    /// How long a toast stays up. Named so the design's value has one home and
+    /// a test can pin it without waiting it out.
+    /// `nonisolated` because a default-argument expression is evaluated in the
+    /// caller's context, which is not the main actor. Safe: an immutable
+    /// `Sendable` constant. Without it this is a hard error under Swift 6.
+    nonisolated static let toastLifetime: Duration = .seconds(2.6)
+
+    /// The timer that blanks the current toast. Readable so a test can *await*
+    /// the expiry instead of sleeping and hoping: the timer's own completion is
+    /// the event under test, and awaiting it takes exactly as long as the
+    /// machine needs — no deadline to blow on a loaded CI runner.
+    private(set) var toastTask: Task<Void, Never>?
 
     func go(_ screen: Screen) {
         withAnimation(.easeOut(duration: 0.2)) {
@@ -56,10 +68,9 @@ final class AppState {
 
     /// Toasts clear themselves after 2.6s, as the design's `toast()` does.
     /// The lifetime is a parameter so tests can exercise expiry and timer
-    /// cancellation without waiting out the real 2.6 seconds — a test that
-    /// sleeps against the true duration has only a fraction of a second of
-    /// margin, and flakes on a loaded machine. Callers use the default.
-    func showToast(_ message: String, for duration: Duration = .seconds(2.6)) {
+    /// cancellation without waiting out the real 2.6 seconds. Callers use the
+    /// default.
+    func showToast(_ message: String, for duration: Duration = AppState.toastLifetime) {
         toastTask?.cancel()
         withAnimation(.easeOut(duration: 0.2)) { toast = message }
         toastTask = Task {

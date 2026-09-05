@@ -1015,53 +1015,55 @@ struct ToastTests {
         #expect(app.toast == "second")
     }
 
-    /// Polls rather than sleeping a fixed span: the assertion is "it becomes
-    /// nil", and on a contended CI runner a fixed sleep sized to the real 2.6s
-    /// lifetime has too little margin. This failed in CI for exactly that
-    /// reason, on a run that took 312s against 4s locally.
-    private func waitForToastToClear(_ app: AppState,
-                                     within limit: Duration = .seconds(15)) async -> Bool {
-        let deadline = ContinuousClock.now.advanced(by: limit)
-        while ContinuousClock.now < deadline {
-            if app.toast == nil { return true }
-            try? await Task.sleep(for: .milliseconds(20))
-        }
-        return app.toast == nil
-    }
+    /// These two tests used to sleep against the clock and were the only
+    /// flaky tests in the suite — first at 3.4s against a 2.6s toast, then,
+    /// after that margin was widened, still failing on a runner where the whole
+    /// suite took 272s against 2s locally.
+    ///
+    /// Sizing a timeout is the wrong instrument: any bound is a guess about a
+    /// machine you do not control. The timer's *own completion* is the event
+    /// under test, so both tests now await `toastTask` directly. That takes
+    /// exactly as long as the machine needs and cannot time out early — a
+    /// hundredfold-slower runner passes at the same rate as this one.
 
     /// The replacement cancels the first toast's timer. Without that, the
     /// earlier timer would fire mid-way through the second toast and blank it.
     ///
-    /// The two lifetimes are deliberately far apart — the first expires almost
-    /// at once, the second not for half a minute — so the check cannot flake on
-    /// a slow machine. A delayed wake makes the first timer *more* likely to
-    /// have fired, not less, so slowness cannot mask the bug.
+    /// Awaiting the *first* timer is what makes this deterministic: when it
+    /// returns, that timer has finished deciding whether to blank the toast, so
+    /// a surviving one has already done its damage. Drop the `cancel()` from
+    /// `showToast` and this fails every run rather than one in fifty.
     @Test("The replaced toast's timer does not blank its successor", .timeLimit(.minutes(1)))
     func replacementCancelsTheOldTimer() async throws {
         let app = AppState()
-        app.showToast("first", for: .milliseconds(50))
+        app.showToast("first", for: .milliseconds(1))
+        let firstTimer = try #require(app.toastTask, "showToast must arm a timer")
+
         app.showToast("second", for: .seconds(30))
-        try await Task.sleep(for: .seconds(1))
+        await firstTimer.value
+
         #expect(app.toast == "second",
-                "the first toast's timer was due long ago and must have been cancelled")
+                "the first toast's timer was cancelled and must not blank its successor")
     }
 
     @Test("A toast clears itself when its life is up", .timeLimit(.minutes(1)))
     func toastExpires() async throws {
         let app = AppState()
-        app.showToast("Added to the book", for: .milliseconds(50))
+        app.showToast("Added to the book", for: .milliseconds(1))
         #expect(app.toast != nil, "the toast is visible before its timer fires")
-        #expect(await waitForToastToClear(app), "the toast never cleared itself")
+
+        let timer = try #require(app.toastTask, "showToast must arm a timer")
+        await timer.value
+
+        #expect(app.toast == nil, "the timer ran to completion and must have cleared the toast")
     }
 
-    /// The shipped lifetime is still the design's 2.6s — the parameter above is
-    /// a test seam, not a behaviour change, and this pins the default.
-    @Test("The default lifetime is unchanged")
-    func defaultLifetimeIsTwoPointSix() async throws {
-        let app = AppState()
-        app.showToast("Added to the book")
-        try await Task.sleep(for: .seconds(1))
-        #expect(app.toast != nil, "a 2.6s toast is still up after 1s")
+    /// The duration parameter is a test seam, not a behaviour change: the
+    /// shipped lifetime is still the design's 2.6s. Pinned by value rather than
+    /// by waiting 2.6 seconds to watch it happen.
+    @Test("The shipped lifetime is still the design's 2.6s")
+    func defaultLifetimeIsUnchanged() {
+        #expect(AppState.toastLifetime == .seconds(2.6))
     }
 
     @Test("reset() clears a live toast at once")
