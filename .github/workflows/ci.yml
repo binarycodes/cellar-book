@@ -1,0 +1,137 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# This workflow only ever compiles and inspects. It is explicitly denied write
+# access to the repository, so no step — nor a compromised third-party action —
+# can push a commit, move a tag, or cut a GitHub Release. Publishing, when it is
+# wanted, belongs in a separate workflow with its own narrow permissions.
+permissions:
+  contents: read
+
+# Third-party actions are pinned to commit SHAs, not floating tags: a tag can be
+# moved to point at different code without the reference here changing. The
+# trailing comment records which release each SHA is, and Dependabot rewrites
+# both together — see .github/dependabot.yml.
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SCHEME: Vinnota
+  # NOTE: the "Release" in the matrix below is Xcode's *build configuration*
+  # (optimised, NDEBUG, `#if DEBUG` stripped) — it is not a distribution step.
+  # Nothing is signed, archived, exported or uploaded anywhere. Building that
+  # configuration is what makes the auth-stub guard meaningful, since the stub
+  # only disappears under it.
+  # `generic/platform=iOS Simulator` needs no particular simulator to exist,
+  # so the job does not break when GitHub changes which runtimes ship on the
+  # runner image. Only the test job needs a concrete device.
+  BUILD_DESTINATION: generic/platform=iOS Simulator
+
+jobs:
+  build:
+    name: Build (${{ matrix.configuration }})
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        configuration: [Debug, Release]
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # Uses the runner image's default Xcode rather than pinning a version,
+      # because a hard-coded /Applications/Xcode_<v>.app fails outright the day
+      # GitHub rotates the image. Pin deliberately if a build ever needs it:
+      #   sudo xcode-select -s /Applications/Xcode_<version>.app
+      # `ls /Applications | grep Xcode` in a scratch run lists what is present.
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Build
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -scheme "$SCHEME" \
+            -configuration ${{ matrix.configuration }} \
+            -destination "$BUILD_DESTINATION" \
+            -derivedDataPath build/dd \
+            CODE_SIGNING_ALLOWED=NO \
+            build 2>&1 | tee build.log
+
+      # The project builds clean today. Letting warnings back in is how it
+      # stops being clean, so fail rather than merely report.
+      - name: Fail on Swift warnings
+        run: |
+          count=$(grep -cE "\.swift.*warning:" build.log || true)
+          echo "Swift warnings: $count"
+          if [ "$count" -ne 0 ]; then
+            grep -E "\.swift.*warning:" build.log | sort -u
+            exit 1
+          fi
+
+      # Regression guard for a real defect: the debug sign-in stub let anyone
+      # past authentication. It is behind #if DEBUG, and this proves it stayed
+      # out of the shipping binary. See OPEN-QUESTIONS.md §4.
+      - name: Assert the debug auth stub is absent from Release
+        if: matrix.configuration == 'Release'
+        run: |
+          binary=$(find build/dd/Build/Products -name Vinnota -type f -perm +111 | head -1)
+          echo "Inspecting: $binary"
+          hits=$(nm -a "$binary" 2>/dev/null | grep -c signInStubbed || true)
+          echo "signInStubbed symbols: $hits"
+          [ "$hits" -eq 0 ] || { echo "::error::Debug sign-in stub leaked into Release"; exit 1; }
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: build-log-${{ matrix.configuration }}
+          path: build.log
+          retention-days: 7
+
+  # Runs only once a test target exists. Until then it is skipped rather than
+  # green, so an empty suite never reads as a passing one.
+  test:
+    name: Unit tests
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Look for a test target
+        id: probe
+        run: |
+          if xcodebuild -list -project Vinnota.xcodeproj | sed -n '/Targets:/,/Build Configurations:/p' | grep -qi "tests"; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::No test target in the project — nothing is being tested. See OPEN-QUESTIONS.md."
+          fi
+
+      - name: Pick an available simulator
+        if: steps.probe.outputs.found == 'true'
+        id: sim
+        run: |
+          name=$(xcrun simctl list devices available --json \
+            | python3 -c "import json,sys;d=json.load(sys.stdin)['devices'];print(next(v['name'] for k in d for v in d[k] if 'iPhone' in v['name']))")
+          echo "Using: $name"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Test
+        if: steps.probe.outputs.found == 'true'
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -scheme "$SCHEME" \
+            -destination "platform=iOS Simulator,name=${{ steps.sim.outputs.name }}" \
+            -derivedDataPath build/dd \
+            CODE_SIGNING_ALLOWED=NO \
+            test

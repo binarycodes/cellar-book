@@ -1,0 +1,14 @@
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+
+# The shared scheme in xcshareddata/ MUST stay committed — CI resolves
+# `-scheme Vinnota` from it, and a fresh clone without it cannot build.
+
+# macOS
+.DS_Store
+
+OPEN-QUESTIONS.md
+design

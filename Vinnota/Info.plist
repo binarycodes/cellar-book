@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<key>CFBundleDisplayName</key>
+	<string>Vinnota</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+
+	<!-- The app is drawn in a fixed dark wine palette; it has no light theme. -->
+	<key>UIUserInterfaceStyle</key>
+	<string>Dark</string>
+	<key>UILaunchScreen</key>
+	<dict>
+		<key>UIColorName</key>
+		<string>LaunchBackground</string>
+	</dict>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+	</array>
+	<key>UIRequiredDeviceCapabilities</key>
+	<array>
+		<string>arm64</string>
+	</array>
+
+	<!-- Bundled faces from the Aura design system and Google Fonts. -->
+	<key>UIAppFonts</key>
+	<array>
+		<string>InstrumentSans.ttf</string>
+		<string>InstrumentSerif-Regular.ttf</string>
+		<string>InstrumentSerif-Italic.ttf</string>
+	</array>
+
+	<!-- Permission copy, written in the app's own voice. -->
+	<key>NSCameraUsageDescription</key>
+	<string>Vinnota uses the camera to read the label on a bottle in front of you.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Vinnota records your tasting notes so you can dictate rather than type.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Vinnota turns your dictated tasting notes into text using Apple's speech recognition. The finished note is stored only on this device.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Vinnota reads label and glass photos you choose from your library.</string>
+</dict>
+</plist>
