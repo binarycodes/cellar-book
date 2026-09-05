@@ -255,15 +255,7 @@ struct ReviewView: View {
         let f = app.form
 
         if let existing = app.editing {
-            existing.producer = f.producer.trimmed
-            existing.name = f.name.trimmed
-            existing.vintage = f.vintage.trimmed
-            existing.region = f.region.trimmed
-            existing.grape = f.grape.trimmed
-            existing.shop = f.shop.trimmed
-            existing.price = f.price.isBlank ? nil : f.price.trimmed
-            existing.currency = f.currency
-            existing.labelPhoto = f.labelPhoto
+            f.apply(to: existing)
             try? context.save()
 
             app.form = WineForm()
@@ -274,29 +266,9 @@ struct ReviewView: View {
             return
         }
 
-        let wine = Wine(
-            producer: f.producer.trimmed,
-            name: f.name.trimmed,
-            vintage: f.vintage.trimmed,
-            region: f.region.trimmed,
-            grape: f.grape.trimmed,
-            shop: f.shop.trimmed,
-            price: f.price.isBlank ? nil : f.price.trimmed,
-            currency: f.currency,
-            labelPhoto: f.labelPhoto
-        )
-        wine.addedByHand = !f.recognized && f.labelPhoto == nil
+        let wine = f.makeWine()
         context.insert(wine)
-
-        // The typed note lands first, then anything dictated.
-        if !f.text.isEmpty {
-            let note = TastingNote(kind: .text, phase: .pre, text: f.text)
-            note.wine = wine
-            context.insert(note)
-        }
-        for dictated in f.notes {
-            let note = TastingNote(kind: dictated.typed ? .text : .voice, phase: .pre,
-                                   text: dictated.text, when: dictated.when)
+        for note in f.makeNotes() {
             note.wine = wine
             context.insert(note)
         }
