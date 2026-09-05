@@ -55,11 +55,15 @@ final class AppState {
     }
 
     /// Toasts clear themselves after 2.6s, as the design's `toast()` does.
-    func showToast(_ message: String) {
+    /// The lifetime is a parameter so tests can exercise expiry and timer
+    /// cancellation without waiting out the real 2.6 seconds — a test that
+    /// sleeps against the true duration has only a fraction of a second of
+    /// margin, and flakes on a loaded machine. Callers use the default.
+    func showToast(_ message: String, for duration: Duration = .seconds(2.6)) {
         toastTask?.cancel()
         withAnimation(.easeOut(duration: 0.2)) { toast = message }
         toastTask = Task {
-            try? await Task.sleep(for: .seconds(2.6))
+            try? await Task.sleep(for: duration)
             guard !Task.isCancelled else { return }
             withAnimation(.easeOut(duration: 0.2)) { toast = nil }
         }
