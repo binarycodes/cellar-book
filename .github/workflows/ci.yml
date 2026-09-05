@@ -125,6 +125,12 @@ jobs:
           echo "Using: $name"
           echo "name=$name" >> "$GITHUB_OUTPUT"
 
+      # Deliberately does NOT pass CODE_SIGNING_ALLOWED=NO. An unsigned app has
+      # no application-identifier entitlement, so the simulator keychain answers
+      # errSecMissingEntitlement and the session-persistence tests skip instead
+      # of running — the auth suite would report green while never touching the
+      # keychain. Simulator builds sign ad-hoc without a team, so this works on
+      # a bare runner.
       - name: Test
         if: steps.probe.outputs.found == 'true'
         run: |
@@ -133,5 +139,28 @@ jobs:
             -scheme "$SCHEME" \
             -destination "platform=iOS Simulator,name=${{ steps.sim.outputs.name }}" \
             -derivedDataPath build/dd \
-            CODE_SIGNING_ALLOWED=NO \
-            test
+            test 2>&1 | tee test.log
+
+      # The build job's gate only compiles the app target, so warnings in the
+      # test target were invisible to CI until a clean build surfaced them.
+      - name: Fail on Swift warnings in the test target
+        if: steps.probe.outputs.found == 'true'
+        run: |
+          count=$(grep -cE "\.swift.*warning:" test.log || true)
+          echo "Swift warnings: $count"
+          if [ "$count" -ne 0 ]; then
+            grep -E "\.swift.*warning:" test.log | sort -u
+            exit 1
+          fi
+
+      # A suite that skips its security tests must not read as a pass.
+      - name: Fail if security tests were skipped
+        if: steps.probe.outputs.found == 'true'
+        run: |
+          skipped=$(grep -cE "skipped:" test.log || true)
+          echo "skipped tests: $skipped"
+          if [ "$skipped" -ne 0 ]; then
+            grep -E "skipped:" test.log | sort -u
+            echo "::error::Tests skipped — the keychain-backed auth tests did not run"
+            exit 1
+          fi

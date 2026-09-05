@@ -55,11 +55,15 @@ final class AppState {
     }
 
     /// Toasts clear themselves after 2.6s, as the design's `toast()` does.
-    func showToast(_ message: String) {
+    /// The lifetime is a parameter so tests can exercise expiry and timer
+    /// cancellation without waiting out the real 2.6 seconds — a test that
+    /// sleeps against the true duration has only a fraction of a second of
+    /// margin, and flakes on a loaded machine. Callers use the default.
+    func showToast(_ message: String, for duration: Duration = .seconds(2.6)) {
         toastTask?.cancel()
         withAnimation(.easeOut(duration: 0.2)) { toast = message }
         toastTask = Task {
-            try? await Task.sleep(for: .seconds(2.6))
+            try? await Task.sleep(for: duration)
             guard !Task.isCancelled else { return }
             withAnimation(.easeOut(duration: 0.2)) { toast = nil }
         }
@@ -118,6 +122,55 @@ struct WineForm {
 
     var isComplete: Bool { missingRequired.isEmpty }
 
+
+    /// Builds the bottle this form describes. Lives on the form rather than
+    /// inside the view's `save()` so the commit path — trimming, the blank-price
+    /// sentinel, the hand-entry flag — is reachable from tests. It was not, and
+    /// a mutation that dropped `.trimmed` went undetected.
+    func makeWine() -> Wine {
+        let wine = Wine(
+            producer: producer.trimmed,
+            name: name.trimmed,
+            vintage: vintage.trimmed,
+            region: region.trimmed,
+            grape: grape.trimmed,
+            shop: shop.trimmed,
+            price: price.isBlank ? nil : price.trimmed,
+            currency: currency,
+            labelPhoto: labelPhoto
+        )
+        // Neither read off a label nor carrying one: the user typed it in.
+        wine.addedByHand = !recognized && labelPhoto == nil
+        return wine
+    }
+
+    /// Writes this form over a bottle already in the book. Mirrors `makeWine`
+    /// field for field; the two must not drift.
+    func apply(to wine: Wine) {
+        wine.producer = producer.trimmed
+        wine.name = name.trimmed
+        wine.vintage = vintage.trimmed
+        wine.region = region.trimmed
+        wine.grape = grape.trimmed
+        wine.shop = shop.trimmed
+        wine.price = price.isBlank ? nil : price.trimmed
+        wine.currency = currency
+        wine.labelPhoto = labelPhoto
+    }
+
+    /// The notes this form has collected, ready to attach to a saved bottle.
+    /// The typed note lands first, then anything dictated.
+    func makeNotes() -> [TastingNote] {
+        var out: [TastingNote] = []
+        if !text.isBlank {
+            out.append(TastingNote(kind: .text, phase: .pre, text: text.trimmed))
+        }
+        for dictated in notes {
+            out.append(TastingNote(kind: dictated.typed ? .text : .voice, phase: .pre,
+                                   text: dictated.text, when: dictated.when))
+        }
+        return out
+    }
 
     /// Loads an existing bottle back into the form for editing. Notes are left
     /// alone — they are their own records with their own affordances.

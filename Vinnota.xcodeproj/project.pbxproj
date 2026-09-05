@@ -8,6 +8,7 @@
 
 /* Begin PBXFileReference section */
 		A100000000000000000001 /* Vinnota.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Vinnota.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A100000000000000000020 /* VinnotaTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = VinnotaTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -30,9 +31,21 @@
 			path = Vinnota;
 			sourceTree = "<group>";
 		};
+		A100000000000000000021 /* VinnotaTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = VinnotaTests;
+			sourceTree = "<group>";
+		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
+		A100000000000000000024 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		A100000000000000000003 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
@@ -47,6 +60,7 @@
 			isa = PBXGroup;
 			children = (
 				A100000000000000000002 /* Vinnota */,
+				A100000000000000000021 /* VinnotaTests */,
 				A100000000000000000004 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -55,6 +69,7 @@
 			isa = PBXGroup;
 			children = (
 				A100000000000000000001 /* Vinnota.app */,
+				A100000000000000000020 /* VinnotaTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -82,7 +97,45 @@
 			productReference = A100000000000000000001 /* Vinnota.app */;
 			productType = "com.apple.product-type.application";
 		};
+		A100000000000000000022 /* VinnotaTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A100000000000000000025 /* Build configuration list for PBXNativeTarget "VinnotaTests" */;
+			buildPhases = (
+				A100000000000000000023 /* Sources */,
+				A100000000000000000024 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				A100000000000000000028 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				A100000000000000000021 /* VinnotaTests */,
+			);
+			name = VinnotaTests;
+			productName = VinnotaTests;
+			productReference = A100000000000000000020 /* VinnotaTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 /* End PBXNativeTarget section */
+
+/* Begin PBXTargetDependency section */
+		A100000000000000000028 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = A100000000000000000005 /* Vinnota */;
+			targetProxy = A100000000000000000029 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin PBXContainerItemProxy section */
+		A100000000000000000029 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = A10000000000000000000A /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = A100000000000000000005;
+			remoteInfo = Vinnota;
+		};
+/* End PBXContainerItemProxy section */
 
 /* Begin PBXProject section */
 		A10000000000000000000A /* Project object */ = {
@@ -112,6 +165,7 @@
 			projectRoot = "";
 			targets = (
 				A100000000000000000005 /* Vinnota */,
+				A100000000000000000022 /* VinnotaTests */,
 			);
 		};
 /* End PBXProject section */
@@ -127,6 +181,13 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
+		A100000000000000000023 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		A100000000000000000006 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -238,6 +299,42 @@
 			};
 			name = Release;
 		};
+		A100000000000000000026 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.vinnota.cellarbook.tests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Vinnota.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Vinnota";
+			};
+			name = Debug;
+		};
+		A100000000000000000027 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.vinnota.cellarbook.tests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Vinnota.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Vinnota";
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -255,6 +352,15 @@
 			buildConfigurations = (
 				A10000000000000000000D /* Debug */,
 				A10000000000000000000E /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A100000000000000000025 /* Build configuration list for PBXNativeTarget "VinnotaTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A100000000000000000026 /* Debug */,
+				A100000000000000000027 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
